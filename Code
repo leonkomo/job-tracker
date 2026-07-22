@@ -1,0 +1,606 @@
+import argparse
+import csv
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# KONFIGURATION - hier anpassen
+# ---------------------------------------------------------------------------
+
+# Keywords, nach denen der Titel der Stellenanzeige durchsucht wird
+# (case-insensitive, "oder"-Verknüpfung -> ein Treffer reicht)
+KEYWORDS = [
+    "data",
+    "daten",
+    "quantitativ",
+    "quantitative",
+    "data analyst",
+    "data scientist",
+    "data science",
+    "datenanalyse",
+    "statistik",
+    "statistiker",
+    "verbraucherpreis",
+    "preisstatistik",
+    "scannerdaten",
+    "wohnimmobilie",
+    "immobilienpreis",
+    "ökonometrie",
+    "econometric",
+    "d36",  # Referat D36
+    "referat",  # generisch, viele Statistik-Stellen tragen "im Referat XY"
+    "bi analyst",
+    "business intelligence",
+    "credit risk",
+    "risikomodellierung",
+    "financial data",
+]
+
+# Stellen, die diese Begriffe im Titel enthalten, werden IMMER ausgeschlossen,
+# unabhängig vom Keyword-Filter (auch bei --no-filter).
+EXCLUDE_KEYWORDS = [
+    "praktikum",
+    "praktikant",
+    "werkstudent",
+    "werkstudentische",
+    "werkstudierende",
+    "studentische hilfskraft",
+    "bachelor",
+    "ausbildung",
+    "duales studium"
+]
+
+# Bekannte Städtenamen zur Standort-Erkennung bei Quellen ohne festes Standort-Feld
+# (KfW). Bei Bedarf ergänzen.
+KNOWN_LOCATIONS = [
+    "Frankfurt am Main", "Frankfurt", "Berlin", "Bonn", "Wiesbaden", "München",
+    "Hamburg", "Köln", "Düsseldorf", "Stuttgart", "Leipzig", "Mainz", "Hannover",
+    "Wetzlar", "Gießen", "Kassel", "Darmstadt", "Offenbach", "Homeoffice",
+    "Remote", "bundesweit",
+]
+
+OUTPUT_DIR = Path(__file__).parent
+SEEN_FILE = OUTPUT_DIR / "seen_jobs.json"
+CSV_FILE = OUTPUT_DIR / "stellenangebote_aktuell.csv"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+CSV_FIELDS = ["arbeitgeber", "titel", "standort", "bewerbungsfrist", "url", "quelle"]
+
+
+def new_job(arbeitgeber, titel, url, quelle, standort="", bewerbungsfrist=""):
+    return {
+        "arbeitgeber": arbeitgeber,
+        "titel": titel.strip(),
+        "standort": standort.strip(),
+        "bewerbungsfrist": bewerbungsfrist.strip(),
+        "url": url,
+        "quelle": quelle,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SCRAPER 1: Deutsche Bundesbank (statisches HTML, mehrere Seiten)
+# ---------------------------------------------------------------------------
+
+BUNDESBANK_URLS = [
+    "https://www.bundesbank.de/de/karriere/jobboerse",
+    "https://www.bundesbank.de/action/de/729936/bbksearch?pageNumString=1",
+    "https://www.bundesbank.de/action/de/729936/bbksearch?pageNumString=2",
+    "https://www.bundesbank.de/action/de/729936/bbksearch?pageNumString=3",
+    "https://www.bundesbank.de/action/de/729936/bbksearch?pageNumString=4",
+]
+
+# matched Detailseiten wie /de/karriere/jobboerse/irgendein-titel-867600
+BUNDESBANK_DETAIL_RE = re.compile(r"^/de/karriere/jobboerse/.+-\d+$")
+
+
+def _find_job_container(link, stop_text="Bewerbungsschluss", max_up=8):
+    """Läuft von einem Element aus nach oben, bis der Container ALLE Stop-Texte
+    enthält. stop_text kann ein einzelner String oder eine Liste von Strings
+    sein (dann müssen alle im Container vorkommen, damit z.B. nicht schon die
+    kleine Zeile mit dem Referenzcode allein als 'Container' durchgeht)."""
+    required = [stop_text] if isinstance(stop_text, str) else list(stop_text)
+    node = link
+    for _ in range(max_up):
+        if node.parent is None:
+            break
+        node = node.parent
+        text = node.get_text()
+        if all(r in text for r in required):
+            return node
+    return link.parent
+
+
+def fetch_bundesbank() -> list[dict]:
+    """Holt Stellenangebote von bundesbank.de (mehrere fest hinterlegte Seiten)."""
+    jobs = []
+    for url in BUNDESBANK_URLS:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"  [Fehler] Bundesbank ({url}): {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for link in soup.find_all("a", href=True):
+            if not BUNDESBANK_DETAIL_RE.match(link["href"]):
+                continue
+            container = _find_job_container(link)
+            full_text = container.get_text(" ", strip=True)
+
+            m = re.search(
+                r"(.*?)Bewerbungsschluss:\s*(\d{2}\.\d{2}\.\d{4})\s*\|\s*([^|]+?)"
+                r"(?:\s+/de/|\s+https?://|$)",
+                full_text,
+            )
+            if m:
+                title, deadline, location = m.group(1).strip(), m.group(2), m.group(3).strip()
+            else:
+                # Fallback: kein Muster erkannt -> nur den Linktext als Titel nehmen
+                title, deadline, location = link.get_text(strip=True) or full_text[:80], "", ""
+
+            if not title:
+                continue
+
+            full_url = "https://www.bundesbank.de" + link["href"]
+            jobs.append(
+                new_job("Deutsche Bundesbank", title, full_url, "bundesbank.de", location, deadline)
+            )
+
+    unique = {j["url"]: j for j in jobs}
+    return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# SCRAPER 2: Statistisches Bundesamt / Destatis (INTERAMT-Widget, JS -> Playwright)
+# ---------------------------------------------------------------------------
+
+DESTATIS_URL = "https://www.destatis.de/DE/Ueber-uns/Karriere/Stellenangebote/_inhalt.html"
+
+
+def fetch_destatis() -> list[dict]:
+    """Holt Stellenangebote von destatis.de. Die Tabelle wird per JS aus dem
+    INTERAMT-Widget nachgeladen -> benötigt Playwright."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "  [Hinweis] Destatis-Scraping übersprungen: Playwright nicht installiert.\n"
+            "            pip install playwright --break-system-packages\n"
+            "            playwright install chromium"
+        )
+        return []
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            page.goto(DESTATIS_URL, timeout=30000)
+            page.wait_for_timeout(3000)  # Zeit für das Nachladen des Widgets geben
+
+            # Manche Widgets laufen in einem Iframe (z.B. direkt von interamt.de)
+            target = page
+            for frame in page.frames:
+                if "interamt" in frame.url:
+                    target = frame
+                    break
+
+            try:
+                target.wait_for_selector("table tbody tr, tr td a", timeout=15000)
+            except Exception:
+                pass  # ggf. leere Trefferliste, unten wird das abgefangen
+
+            html = target.content()
+            browser.close()
+    except Exception as e:
+        print(f"  [Fehler] Destatis: Seite konnte nicht geladen werden ({e})")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.select("table tbody tr") or soup.select("tr")
+
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+        link = cells[0].find("a")
+        title = (link.get_text(strip=True) if link else cells[0].get_text(strip=True))
+        if not title:
+            continue
+        href = link.get("href", "") if link else ""
+        full_url = href if href.startswith("http") else f"https://www.interamt.de{href}"
+
+        # Spalten lt. Kopfzeile: Stellenangebote | Abschluss | Einsatzort | Online seit | Bewerbungsfrist | ...
+        location = cells[2].get_text(strip=True) if len(cells) > 2 else ""
+        deadline = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+
+        jobs.append(new_job("Statistisches Bundesamt", title, full_url, "destatis.de", location, deadline))
+
+    unique = {j["url"]: j for j in jobs}
+    return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# SCRAPER 3: KfW Bankengruppe (JS-Portal -> Playwright)
+# ---------------------------------------------------------------------------
+
+KFW_URL = "https://jobs.kfw.de/index.php?ac=search_result"
+
+
+def _guess_location(text: str) -> str:
+    for city in KNOWN_LOCATIONS:
+        if city.lower() in text.lower():
+            return city
+    return ""
+
+
+def fetch_kfw() -> list[dict]:
+    """Holt Stellenangebote von jobs.kfw.de. Benötigt Playwright + Chromium."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "  [Hinweis] KfW-Scraping übersprungen: Playwright nicht installiert.\n"
+            "            pip install playwright --break-system-packages\n"
+            "            playwright install chromium"
+        )
+        return []
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            page.goto(KFW_URL, timeout=30000)
+            page.wait_for_selector("a[href*='ac=jobad']", timeout=15000)
+            html = page.content()
+            browser.close()
+    except Exception as e:
+        print(f"  [Fehler] KfW: Seite konnte nicht geladen werden ({e})")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.select("a[href*='ac=jobad']"):
+        title = link.get_text(strip=True)
+        href = link.get("href", "")
+        if not title or not href:
+            continue
+        full_url = href if href.startswith("http") else f"https://jobs.kfw.de/{href.lstrip('/')}"
+
+        # Fest 4 Ebenen nach oben klettern für einen Container, der genug vom
+        # Kartentext (Standort) enthält, ohne stop_text zu benutzen (der bei
+        # leerem String sofort beim ersten Schritt "matcht").
+        container = link
+        for _ in range(4):
+            if container.parent is None:
+                break
+            container = container.parent
+        card_text = container.get_text(" ", strip=True)
+        location = _guess_location(card_text)
+
+        jobs.append(new_job("KfW Bankengruppe", title, full_url, "jobs.kfw.de", location))
+
+    unique = {j["url"]: j for j in jobs}
+    return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# SCRAPER 4: Land Hessen (Single-Page-App -> Playwright, eine Suche pro Keyword)
+# ---------------------------------------------------------------------------
+
+# Statt die allgemeine Trefferliste zu laden und client-seitig zu filtern, nutzen
+# wir direkt die Suchfunktion der Seite: .../Suche/searchvalue=<begriff>
+# Das ist zuverlässiger, weil wir dann pro Aufruf nur wenige, relevante Treffer
+# bekommen statt hunderter Landesstellen. Es wird pro KEYWORDS-Eintrag ein
+# eigener Suchaufruf gemacht (Mehrwort-Begriffe werden URL-encodiert).
+HESSEN_SEARCH_URL_TEMPLATE = "https://stellensuche.hessen.de/unreg/index.html#/Suche/searchvalue={term}"
+
+# Referenzcode ist auf jeder Karte vorhanden und eindeutig -> guter Anker zum
+# Auffinden des Karten-Containers und zur Duplikaterkennung (mehrere Keywords
+# können denselben Treffer liefern).
+HESSEN_REF_RE = re.compile(r"Referenzcode:\s*(\S+)")
+HESSEN_DEADLINE_RE = re.compile(r"Bewerbungsfrist:\s*(\d{2}\.\d{2}\.\d{4})")
+
+# Zeilen, die sicher KEIN Standort/Arbeitgeber sind (bekannte Tags auf den Karten)
+HESSEN_IGNORE_LINES = {
+    "berufstätigkeit", "unbefristet", "befristet", "vollzeit", "teilzeit",
+    "stellendetails ansehen", "ausbildung", "praktikum", "duales studium",
+}
+
+
+def _parse_hessen_card(container) -> dict | None:
+    """Extrahiert Titel, Standort, Referenzcode, Bewerbungsfrist und Link aus
+    einer Stellenkarte (Struktur laut Screenshot: Titel, Button, Arbeitgeber,
+    Tags, Standort, Referenzcode, Bewerbungsfrist, 'vor N Tagen veröffentlicht')."""
+    full_text = container.get_text(" ", strip=True)
+    ref_match = HESSEN_REF_RE.search(full_text)
+    if not ref_match:
+        return None  # kein vollständiger Treffer -> überspringen
+
+    lines = [l.strip() for l in container.get_text("\n", strip=True).split("\n") if l.strip()]
+    title = lines[0] if lines else ""
+
+    ref_idx = next((i for i, l in enumerate(lines) if l.startswith("Referenzcode:")), None)
+    location = ""
+    if ref_idx is not None:
+        # Standort ist typischerweise die Zeile direkt vor "Referenzcode:"
+        for l in reversed(lines[:ref_idx]):
+            if l.lower() not in HESSEN_IGNORE_LINES:
+                location = l
+                break
+
+    deadline_match = HESSEN_DEADLINE_RE.search(full_text)
+    deadline = deadline_match.group(1) if deadline_match else ""
+
+    detail_link = container.find(
+        "a", href=True, string=lambda s: s and ("ansehen" in s.lower() or "detail" in s.lower())
+    )
+    if not detail_link:
+        detail_link = container.find("a", href=True)
+
+    ref_code = ref_match.group(1)
+    if detail_link:
+        href = detail_link["href"]
+        if href.startswith("http"):
+            full_url = href
+        elif href.startswith("#"):
+            # SPA-Hash-Route (z.B. "#/Details/51204672_0006") -> muss HINTER der
+            # eigentlichen index.html hängen, nicht direkt an der Domain, sonst
+            # landet man nur auf der Startseite ohne die App-Route.
+            full_url = f"https://stellensuche.hessen.de/unreg/index.html{href}"
+        elif href.startswith("javascript:") or href in ("", "#"):
+            # Kein echter Link, sondern ein reiner JS-Klick-Handler (kein href
+            # zum Folgen) -> auf die Suche nach dem Referenzcode ausweichen,
+            # die nachweislich funktioniert.
+            from urllib.parse import quote as _quote
+            full_url = HESSEN_SEARCH_URL_TEMPLATE.format(term=_quote(ref_code))
+        elif href.startswith("/"):
+            full_url = f"https://stellensuche.hessen.de{href}"
+        else:
+            full_url = f"https://stellensuche.hessen.de/unreg/{href}"
+    else:
+        # Kein <a> im Container gefunden -> auf die Suche nach dem
+        # Referenzcode ausweichen (funktioniert nachweislich, siehe fetch_hessen)
+        from urllib.parse import quote as _quote
+        full_url = HESSEN_SEARCH_URL_TEMPLATE.format(term=_quote(ref_code))
+
+    return {
+        "titel": title,
+        "standort": location,
+        "referenzcode": ref_match.group(1),
+        "bewerbungsfrist": deadline,
+        "url": full_url,
+    }
+
+
+def fetch_hessen(search_terms: list[str] | None = None) -> list[dict]:
+    """Holt Stellenangebote von stellensuche.hessen.de - eine Suche pro Keyword."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "  [Hinweis] Hessen-Scraping übersprungen: Playwright nicht installiert.\n"
+            "            pip install playwright --break-system-packages\n"
+            "            playwright install chromium"
+        )
+        return []
+
+    from urllib.parse import quote
+
+    terms = search_terms if search_terms is not None else KEYWORDS
+    jobs_by_ref: dict[str, dict] = {}
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+
+            for term in terms:
+                url = HESSEN_SEARCH_URL_TEMPLATE.format(term=quote(term))
+                try:
+                    page.goto(url, timeout=30000)
+                    # SPA braucht etwas Zeit, um die Suche auszuführen und zu rendern
+                    page.wait_for_timeout(3000)
+                    try:
+                        page.wait_for_selector("text=Referenzcode", timeout=8000)
+                    except Exception:
+                        pass  # ggf. 0 Treffer für diesen Begriff
+                    html = page.content()
+                except Exception as e:
+                    print(f"  [Fehler] Hessen (Suche '{term}'): {e}")
+                    continue
+
+                soup = BeautifulSoup(html, "html.parser")
+                # Für jede Referenzcode-Textstelle den umschließenden Karten-Container suchen.
+                # Wichtig: mehrere Anker verlangen (Referenzcode + "ansehen"-Button), sonst
+                # wird schon die winzige Zeile mit der Referenzcode-ID allein als Container
+                # akzeptiert (dort steht dann kein Titel und kein Link drin).
+                for ref_node in soup.find_all(string=HESSEN_REF_RE):
+                    container = _find_job_container(
+                        ref_node.parent,
+                        stop_text=["Referenzcode", "ansehen"],
+                        max_up=12,
+                    )
+                    parsed = _parse_hessen_card(container)
+                    if parsed and parsed["titel"]:
+                        jobs_by_ref[parsed["referenzcode"]] = parsed
+
+            browser.close()
+    except Exception as e:
+        print(f"  [Fehler] Hessen: Browser konnte nicht gestartet werden ({e})")
+        return []
+
+    return [
+        new_job(
+            "Land Hessen", j["titel"], j["url"], "stellensuche.hessen.de",
+            j["standort"], j["bewerbungsfrist"],
+        )
+        for j in jobs_by_ref.values()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# SCRAPER 5: Deutsche Börse (statisches HTML)
+# ---------------------------------------------------------------------------
+
+DEUTSCHE_BOERSE_URL = (
+    "https://careers.deutsche-boerse.com/search"
+    "?career_level=Graduates&location=Frankfurt%20am%20Main"
+)
+
+
+def fetch_deutsche_boerse() -> list[dict]:
+    """Holt Stellenangebote von careers.deutsche-boerse.com.
+    ACHTUNG: Die career_level/location-Parameter in der URL scheinen NICHT
+    serverseitig zu filtern (die Seite liefert immer alle ~40 offenen
+    Stellen zurück) - macht aber nichts, weil unser eigener Keyword-Filter
+    danach sowieso greift. Standort steht nicht in der Trefferliste
+    (nur Titel + Link), daher bleibt die Standort-Spalte hier meist leer."""
+    try:
+        resp = requests.get(DEUTSCHE_BOERSE_URL, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  [Fehler] Deutsche Börse: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    jobs = []
+    for link in soup.select("a[href*='/offer-redirect/']"):
+        title = link.get_text(strip=True)
+        href = link.get("href", "")
+        if not title or not href:
+            continue
+        full_url = href if href.startswith("http") else f"https://careers.deutsche-boerse.com{href}"
+        jobs.append(new_job("Deutsche Börse", title, full_url, "careers.deutsche-boerse.com"))
+
+    unique = {j["url"]: j for j in jobs}
+    return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# FILTER & SPEICHERN
+# ---------------------------------------------------------------------------
+
+
+def matches_any(title: str, keywords: list[str]) -> bool:
+    title_lower = title.lower()
+    return any(kw.lower() in title_lower for kw in keywords)
+
+
+def load_seen() -> set:
+    if SEEN_FILE.exists():
+        return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+    return set()
+
+
+def save_seen(seen_ids: set) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(seen_ids), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_csv(jobs: list[dict]) -> None:
+    if not jobs:
+        return
+    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(jobs)
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Job-Tracker Destatis / Bundesbank / KfW / Hessen")
+    parser.add_argument("--all", action="store_true", help="Zeigt alle aktuellen Treffer, nicht nur neue")
+    parser.add_argument("--no-filter", action="store_true", help="Ignoriert den Keyword-Filter")
+    args = parser.parse_args()
+
+    print(f"=== Job-Tracker Lauf: {datetime.now():%Y-%m-%d %H:%M} ===\n")
+
+    all_jobs = []
+
+    print("Durchsuche bundesbank.de ...")
+    bb_jobs = fetch_bundesbank()
+    print(f"  Deutsche Bundesbank: {len(bb_jobs)} Stellen gefunden")
+    all_jobs.extend(bb_jobs)
+
+    print("Durchsuche destatis.de ...")
+    destatis_jobs = fetch_destatis()
+    print(f"  Statistisches Bundesamt: {len(destatis_jobs)} Stellen gefunden")
+    all_jobs.extend(destatis_jobs)
+
+    print("Durchsuche jobs.kfw.de ...")
+    kfw_jobs = fetch_kfw()
+    print(f"  KfW Bankengruppe: {len(kfw_jobs)} Stellen gefunden")
+    all_jobs.extend(kfw_jobs)
+
+    print("Durchsuche stellensuche.hessen.de (eine Suche pro Keyword) ...")
+    hessen_jobs = fetch_hessen()
+    print(f"  Land Hessen: {len(hessen_jobs)} Stellen gefunden")
+    all_jobs.extend(hessen_jobs)
+
+    print("Durchsuche careers.deutsche-boerse.com ...")
+    boerse_jobs = fetch_deutsche_boerse()
+    print(f"  Deutsche Börse: {len(boerse_jobs)} Stellen gefunden")
+    all_jobs.extend(boerse_jobs)
+
+    print(f"\nInsgesamt {len(all_jobs)} Stellenangebote abgerufen.\n")
+
+    # Praktika/Werkstudentenstellen IMMER ausschließen
+    all_jobs = [j for j in all_jobs if not matches_any(j["titel"], EXCLUDE_KEYWORDS)]
+    print(f"Nach Ausschluss von Praktikum/Werkstudent: {len(all_jobs)}\n")
+
+    # Keyword-Filter anwenden. Hessen wurde bereits über die Suchfunktion der
+    # Seite selbst gefiltert (ein Aufruf pro Keyword) -> hier nicht nochmal
+    # gegen den Titel filtern, sonst gehen Treffer verloren, bei denen das
+    # Keyword nur in der (von uns nicht gescrapten) Beschreibung vorkommt.
+    if args.no_filter:
+        relevant = all_jobs
+    else:
+        relevant = [
+            j for j in all_jobs
+            if j["quelle"] == "stellensuche.hessen.de" or matches_any(j["titel"], KEYWORDS)
+        ]
+
+    print(f"Relevant nach Keyword-Filter: {len(relevant)}\n")
+
+    # Neue vs. bekannte Anzeigen
+    seen = load_seen()
+    if args.all:
+        to_show = relevant
+    else:
+        to_show = [j for j in relevant if j["url"] not in seen]
+
+    if to_show:
+        print(f"--- {len(to_show)} {'Treffer' if args.all else 'NEUE Treffer'} ---\n")
+        for j in to_show:
+            ort = j["standort"] or "Standort unbekannt"
+            frist = f" | Frist: {j['bewerbungsfrist']}" if j["bewerbungsfrist"] else ""
+            print(f"[{j['arbeitgeber']}] {j['titel']}")
+            print(f"    {ort}{frist}")
+            print(f"    {j['url']}\n")
+    else:
+        print("Keine neuen relevanten Stellenangebote seit dem letzten Lauf.")
+
+    # Speichern
+    seen.update(j["url"] for j in relevant)
+    save_seen(seen)
+    save_csv(all_jobs)
+    print(f"\nVollständige Liste (inkl. Standort) gespeichert unter: {CSV_FILE}")
+
+
+if __name__ == "__main__":
+    main()
