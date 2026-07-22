@@ -1,6 +1,6 @@
 Job-Tracker: Destatis, Bundesbank, KfW, Land Hessen, Deutsche Börse
 
-Durchsucht automatisiert die Stellenangebote von:
+Automatically searches job listings from:
 
   - Statistisches Bundesamt (Destatis)  -> destatis.de (INTERAMT-Widget, JS)
   - Deutsche Bundesbank                 -> bundesbank.de/de/karriere/jobboerse (statisches HTML)
